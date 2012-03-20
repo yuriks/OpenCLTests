@@ -3,6 +3,20 @@
 #include <fstream>
 #include <vector>
 #include <cstdlib>
+#include <memory>
+
+template <typename T>
+struct Array {
+	Array(size_t sz) : data(new T[sz]), size(sz) { }
+	~Array() { delete[] data; }
+	operator T* () { return data; }
+	operator const T* () const { return data; }
+	void free()	{ delete[] data; data = nullptr; size = 0; }
+
+	T* data;
+	size_t size;
+};
+
 
 void checkOpenCLError(cl_int return_code, const char* file, int line)
 {
@@ -209,27 +223,46 @@ bool checkProgramLog(cl_program program, cl_device_id device_id)
 	return false;
 }
 
-void fillWithRandomData(std::vector<float>& v)
+void fillWithRandomData(Array<float>& v)
 {
-	for (size_t i = 0; i < v.size(); ++i) {
-		v[i] = rand() / (float)RAND_MAX;
+	for (size_t i = 0; i < v.size; ++i) {
+		v[i] = rand() / (float)RAND_MAX * 10.0f;
 	}
 }
 
 void sumKernelCpu(size_t n, const float* src_a, const float* src_b, float* dst)
 {
-	for (size_t i = 0; i < n; ++i)
-		dst[i] = src_a[i] + src_b[i];
+	for (size_t i = 0; i < n; ++i) {
+		float sum = 0.0f;
+
+		for (int j = -20; j <= 20; ++j) {
+			int index = i+j;
+			if (index < 0)
+				index = 0;
+			else if ((size_t)index >= n)
+				index = n-1;
+
+			float a = src_a[index];
+			float b = src_b[index];
+			sum += a*a + b*b;
+		}
+
+		dst[i] = sum / 41.0f;
+	}
 }
 
-bool compareResults(const std::vector<float>& v_a, const std::vector<float>& v_b)
+bool compareResults(const Array<float>& v_a, const Array<float>& v_b)
 {
-	if (v_a.size() != v_b.size())
+	static const float EPS = 0.0001f;
+
+	if (v_a.size != v_b.size)
 		return false;
 
-	for (size_t i = 0; i < v_a.size(); ++i) {
-		if (v_a[i] != v_b[i])
+	for (size_t i = 0; i < v_a.size; ++i) {
+		if (std::abs(v_a[i] - v_b[i]) > EPS) {
+			std::cout << i << '\n';
 			return false;
+		}
 	}
 
 	return true;
@@ -252,7 +285,7 @@ int program_main()
 	cl_program program = loadProgramFromFile(context, "sum.cl");
 
 	std::cout << "Building program...\n";
-	CHECK(clBuildProgram(program, 0, nullptr, "-cl-mad-enable -cl-fast-relaxed-math", nullptr, nullptr));
+	CHECK(clBuildProgram(program, 0, nullptr, "-Werror -cl-mad-enable -cl-fast-relaxed-math", nullptr, nullptr));
 	if (!checkProgramLog(program, device_id)) {
 		return 1;
 	}
@@ -263,10 +296,10 @@ int program_main()
 	std::cout << "Allocating host buffers...\n";
 
 	static const size_t WORK_DATA_SIZE = 16 * 1024 * 1024;
-	std::vector<float> src_a(WORK_DATA_SIZE);
-	std::vector<float> src_b(WORK_DATA_SIZE);
-	std::vector<float> dst_opencl(WORK_DATA_SIZE);
-	std::vector<float> dst_reference(WORK_DATA_SIZE);
+	Array<float> src_a(WORK_DATA_SIZE);
+	Array<float> src_b(WORK_DATA_SIZE);
+	Array<float> dst_opencl(WORK_DATA_SIZE);
+	Array<float> dst_reference(WORK_DATA_SIZE);
 
 	srand(0);
 	fillWithRandomData(src_a);
@@ -274,9 +307,9 @@ int program_main()
 
 	std::cout << "Creating OpenCL buffers...\n";
 
-	cl_mem src_a_buf = clCreateBuffer(context, CL_MEM_READ_ONLY,  src_a.size()      * sizeof(float), nullptr, &error_code); CHECK(error_code);
-	cl_mem src_b_buf = clCreateBuffer(context, CL_MEM_READ_ONLY,  src_b.size()      * sizeof(float), nullptr, &error_code); CHECK(error_code);
-	cl_mem dst_buf   = clCreateBuffer(context, CL_MEM_WRITE_ONLY, dst_opencl.size() * sizeof(float), nullptr, &error_code); CHECK(error_code);
+	cl_mem src_a_buf = clCreateBuffer(context, CL_MEM_READ_ONLY,  src_a.size      * sizeof(float), nullptr, &error_code); CHECK(error_code);
+	cl_mem src_b_buf = clCreateBuffer(context, CL_MEM_READ_ONLY,  src_b.size      * sizeof(float), nullptr, &error_code); CHECK(error_code);
+	cl_mem dst_buf   = clCreateBuffer(context, CL_MEM_WRITE_ONLY, dst_opencl.size * sizeof(float), nullptr, &error_code); CHECK(error_code);
 
 	std::cout << "Setting kernel arguments...\n";
 	CHECK(clSetKernelArg(sum_kernel, 0, sizeof(src_a_buf), &src_a_buf));
@@ -284,13 +317,13 @@ int program_main()
 	CHECK(clSetKernelArg(sum_kernel, 2, sizeof(dst_buf),   &dst_buf));
 
 	std::cout << "\nRunning CPU algorithm...\n";
-	sumKernelCpu(dst_reference.size(), src_a.data(), src_b.data(), dst_reference.data());
+	sumKernelCpu(dst_reference.size, src_a, src_b, dst_reference);
 	std::cout << "Done!\n\n";
 
 	std::cout << "Copying from host to OpenCL buffers...\n";
 	CHECK(clFinish(cmd_queue));
-	CHECK(clEnqueueWriteBuffer(cmd_queue, src_a_buf, CL_FALSE, 0, src_a.size() * sizeof(float), src_a.data(), 0, nullptr, nullptr));
-	CHECK(clEnqueueWriteBuffer(cmd_queue, src_b_buf, CL_FALSE, 0, src_b.size() * sizeof(float), src_b.data(), 0, nullptr, nullptr));
+	CHECK(clEnqueueWriteBuffer(cmd_queue, src_a_buf, CL_FALSE, 0, src_a.size * sizeof(float), src_a, 0, nullptr, nullptr));
+	CHECK(clEnqueueWriteBuffer(cmd_queue, src_b_buf, CL_FALSE, 0, src_b.size * sizeof(float), src_b, 0, nullptr, nullptr));
 	CHECK(clFinish(cmd_queue));
 
 	std::cout << "Executing OpenCL kernel...\n";
@@ -299,7 +332,7 @@ int program_main()
 	CHECK(clFinish(cmd_queue));
 
 	std::cout << "Reading computation results back to host...\n";
-	CHECK(clEnqueueReadBuffer(cmd_queue, dst_buf, CL_FALSE, 0, dst_opencl.size() * sizeof(float), dst_opencl.data(), 0, nullptr, nullptr));
+	CHECK(clEnqueueReadBuffer(cmd_queue, dst_buf, CL_FALSE, 0, dst_opencl.size * sizeof(float), dst_opencl, 0, nullptr, nullptr));
 	CHECK(clFinish(cmd_queue));
 	std::cout << "Done!\n\n";
 
@@ -314,6 +347,12 @@ int program_main()
 	CHECK(clReleaseMemObject(src_a_buf));
 	CHECK(clReleaseMemObject(src_b_buf));
 	CHECK(clReleaseMemObject(dst_buf));
+
+	std::cout << "Freeing host buffers...\n";
+	src_a.free();
+	src_b.free();
+	dst_opencl.free();
+	dst_reference.free();
 
 	std::cout << "Releasing kernel...\n";
 	CHECK(clReleaseKernel(sum_kernel));
