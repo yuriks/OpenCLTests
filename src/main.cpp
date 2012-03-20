@@ -2,6 +2,7 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <cstdlib>
 
 void checkOpenCLError(cl_int return_code, const char* file, int line)
 {
@@ -156,8 +157,88 @@ cl_command_queue createCommandQueue(cl_context context, cl_device_id device_id)
 	return cmd_queue;
 }
 
+cl_program loadProgramFromFile(cl_context context, const char* fname)
+{
+	std::ifstream f(fname);
+
+	if (!f)
+		return nullptr;
+
+	std::vector<char> str;
+
+	f.seekg(0, std::ios::end);
+	str.reserve((unsigned int)f.tellg() + 1);
+	f.seekg(0);
+
+	str.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+	str.push_back('\0');
+
+	const char* str_ptr = str.data();
+
+	cl_int error_code;
+	cl_program program = clCreateProgramWithSource(context, 1, &str_ptr, nullptr, &error_code);
+	CHECK(error_code);
+
+	return program;
+}
+
+bool checkProgramLog(cl_program program, cl_device_id device_id)
+{
+	cl_build_status status;
+	CHECK(clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_STATUS, sizeof(status), &status, nullptr));
+
+	if (status == CL_BUILD_SUCCESS) {
+		std::cout << "Program built successfully!\n";
+		return true;
+	} else if (status == CL_BUILD_ERROR) {
+		std::cout << "Program failed to build:\n";
+
+		size_t log_size;
+		CHECK(clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size));
+
+		std::vector<char> log_buffer(log_size);
+		CHECK(clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, log_buffer.size(), log_buffer.data(), nullptr));
+
+		std::cout << log_buffer.data();
+	} else if (status == CL_BUILD_NONE) {
+		std::cout << "No build done.\n";
+	} else if (status == CL_BUILD_IN_PROGRESS) {
+		std::cout << "Build is still in progress.\n";
+	}
+
+	return false;
+}
+
+void fillWithRandomData(std::vector<float>& v)
+{
+	for (size_t i = 0; i < v.size(); ++i) {
+		v[i] = rand() / (float)RAND_MAX;
+	}
+}
+
+void sumKernelCpu(size_t n, const float* src_a, const float* src_b, float* dst)
+{
+	for (size_t i = 0; i < n; ++i)
+		dst[i] = src_a[i] + src_b[i];
+}
+
+bool compareResults(const std::vector<float>& v_a, const std::vector<float>& v_b)
+{
+	if (v_a.size() != v_b.size())
+		return false;
+
+	for (size_t i = 0; i < v_a.size(); ++i) {
+		if (v_a[i] != v_b[i])
+			return false;
+	}
+
+	return true;
+}
+
 int program_main()
 {
+	cl_int error_code;
+
 	cl_platform_id platform_id;
 	cl_device_id device_id;
 
@@ -166,6 +247,79 @@ int program_main()
 
 	cl_context context = createContext(platform_id, device_id);
 	cl_command_queue cmd_queue = createCommandQueue(context, device_id);
+
+	std::cout << "Loading program from sum.cl...\n";
+	cl_program program = loadProgramFromFile(context, "sum.cl");
+
+	std::cout << "Building program...\n";
+	CHECK(clBuildProgram(program, 0, nullptr, "-cl-mad-enable -cl-fast-relaxed-math", nullptr, nullptr));
+	if (!checkProgramLog(program, device_id)) {
+		return 1;
+	}
+
+	std::cout << "Creating \"sum\" kernel...\n";
+	cl_kernel sum_kernel = clCreateKernel(program, "sum", &error_code); CHECK(error_code);
+
+	std::cout << "Allocating host buffers...\n";
+
+	static const size_t WORK_DATA_SIZE = 16 * 1024 * 1024;
+	std::vector<float> src_a(WORK_DATA_SIZE);
+	std::vector<float> src_b(WORK_DATA_SIZE);
+	std::vector<float> dst_opencl(WORK_DATA_SIZE);
+	std::vector<float> dst_reference(WORK_DATA_SIZE);
+
+	srand(0);
+	fillWithRandomData(src_a);
+	fillWithRandomData(src_b);
+
+	std::cout << "Creating OpenCL buffers...\n";
+
+	cl_mem src_a_buf = clCreateBuffer(context, CL_MEM_READ_ONLY,  src_a.size()      * sizeof(float), nullptr, &error_code); CHECK(error_code);
+	cl_mem src_b_buf = clCreateBuffer(context, CL_MEM_READ_ONLY,  src_b.size()      * sizeof(float), nullptr, &error_code); CHECK(error_code);
+	cl_mem dst_buf   = clCreateBuffer(context, CL_MEM_WRITE_ONLY, dst_opencl.size() * sizeof(float), nullptr, &error_code); CHECK(error_code);
+
+	std::cout << "Setting kernel arguments...\n";
+	CHECK(clSetKernelArg(sum_kernel, 0, sizeof(src_a_buf), &src_a_buf));
+	CHECK(clSetKernelArg(sum_kernel, 1, sizeof(src_b_buf), &src_b_buf));
+	CHECK(clSetKernelArg(sum_kernel, 2, sizeof(dst_buf),   &dst_buf));
+
+	std::cout << "\nRunning CPU algorithm...\n";
+	sumKernelCpu(dst_reference.size(), src_a.data(), src_b.data(), dst_reference.data());
+	std::cout << "Done!\n\n";
+
+	std::cout << "Copying from host to OpenCL buffers...\n";
+	CHECK(clFinish(cmd_queue));
+	CHECK(clEnqueueWriteBuffer(cmd_queue, src_a_buf, CL_FALSE, 0, src_a.size() * sizeof(float), src_a.data(), 0, nullptr, nullptr));
+	CHECK(clEnqueueWriteBuffer(cmd_queue, src_b_buf, CL_FALSE, 0, src_b.size() * sizeof(float), src_b.data(), 0, nullptr, nullptr));
+	CHECK(clFinish(cmd_queue));
+
+	std::cout << "Executing OpenCL kernel...\n";
+	const cl_uint work_dimensions[1] = { WORK_DATA_SIZE };
+	CHECK(clEnqueueNDRangeKernel(cmd_queue, sum_kernel, 1, nullptr, work_dimensions, nullptr, 0, nullptr, nullptr));
+	CHECK(clFinish(cmd_queue));
+
+	std::cout << "Reading computation results back to host...\n";
+	CHECK(clEnqueueReadBuffer(cmd_queue, dst_buf, CL_FALSE, 0, dst_opencl.size() * sizeof(float), dst_opencl.data(), 0, nullptr, nullptr));
+	CHECK(clFinish(cmd_queue));
+	std::cout << "Done!\n\n";
+
+	std::cout << "Comparing results...\n";
+	if (compareResults(dst_opencl, dst_reference)) {
+		std::cout << "Results match!\n\n";
+	} else {
+		std::cout << "Results don't match! :(\n\n";
+	}
+
+	std::cout << "Releasing OpenCL buffers...\n";
+	CHECK(clReleaseMemObject(src_a_buf));
+	CHECK(clReleaseMemObject(src_b_buf));
+	CHECK(clReleaseMemObject(dst_buf));
+
+	std::cout << "Releasing kernel...\n";
+	CHECK(clReleaseKernel(sum_kernel));
+
+	std::cout << "Releasing program...\n";
+	CHECK(clReleaseProgram(program));
 
 	std::cout << "Releasing command queue...\n";
 	CHECK(clReleaseCommandQueue(cmd_queue));
