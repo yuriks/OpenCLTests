@@ -253,7 +253,7 @@ void sumKernelCpu(size_t n, const float* src_a, const float* src_b, float* dst)
 
 bool compareResults(const Array<float>& v_a, const Array<float>& v_b)
 {
-	static const float EPS = 0.0001f;
+	static const float EPS = 0.00005f;
 
 	if (v_a.size != v_b.size)
 		return false;
