@@ -295,7 +295,7 @@ int program_main()
 
 	std::cout << "Allocating host buffers...\n";
 
-	static const size_t WORK_DATA_SIZE = 16 * 1024 * 1024;
+	static const size_t WORK_DATA_SIZE = 8 * 1024 * 1024;
 	Array<float> src_a(WORK_DATA_SIZE);
 	Array<float> src_b(WORK_DATA_SIZE);
 	Array<float> dst_opencl(WORK_DATA_SIZE);
