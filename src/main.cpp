@@ -233,21 +233,10 @@ void fillWithRandomData(Array<float>& v)
 void sumKernelCpu(size_t n, const float* src_a, const float* src_b, float* dst)
 {
 	for (size_t i = 0; i < n; ++i) {
-		float sum = 0.0f;
+		float a = src_a[i];
+		float b = src_b[i];
 
-		for (int j = -20; j <= 20; ++j) {
-			int index = i+j;
-			if (index < 0)
-				index = 0;
-			else if ((size_t)index >= n)
-				index = n-1;
-
-			float a = src_a[index];
-			float b = src_b[index];
-			sum += a*a + b*b;
-		}
-
-		dst[i] = sum / 41.0f;
+		dst[i] = a*a + b*b;
 	}
 }
 
