@@ -6,6 +6,8 @@
 #include <memory>
 #include <numeric>
 
+#include "timer.hpp"
+
 template <typename T>
 struct Array {
 	Array(size_t sz) : data(new T[sz]), size(sz) { }
@@ -290,6 +292,22 @@ bool compareResults(const Array<float>& v_a, const Array<float>& v_b)
 	return true;
 }
 
+void printTimingStats(const double* timing_samples, int n)
+{
+	double total_ms = std::accumulate(timing_samples, timing_samples + n, 0.0);
+	double mean_ms = total_ms / n;
+
+	double sqr_mean_ms = std::accumulate(timing_samples, timing_samples + n, 0.0, [](double a, double b) { return a + b*b; });
+	sqr_mean_ms /= n;
+
+	double std_dev_ms = std::sqrt(sqr_mean_ms - mean_ms*mean_ms);
+
+	std::cout << "Timing stats:\n" <<
+		"    Total: "     << total_ms    << "ms\n" <<
+		"    Mean: "      << mean_ms     << "ms\n" <<
+		"    Std. dev.: " << std_dev_ms  << "ms\n";
+}
+
 int program_main()
 {
 	cl_int error_code;
@@ -353,10 +371,21 @@ int program_main()
 	CHECK(clSetKernelArg(reduce_pass2_kernel, 1, sizeof(final_sum_buf), &final_sum_buf));
 	CHECK(clSetKernelArg(reduce_pass2_kernel, 2, sizeof(size_t),        &PARTIAL_SUMS_SIZE));
 
+	static const int NUM_TIMING_SAMPLES = 4096;
+	double timing_samples[NUM_TIMING_SAMPLES];
+
+	float cpu_result;
 	Array<float> dst_reference(SUM_DATA_SIZE);
 	std::cout << "\nRunning CPU algorithm...\n";
-	sumKernelCpu(dst_reference.size, src_a, src_b, dst_reference);
-	float cpu_result = reduceKernelCpu(dst_reference.size, dst_reference);
+	for (int run = 0; run < NUM_TIMING_SAMPLES; ++run) {
+		startPerfTimer();
+
+		sumKernelCpu(dst_reference.size, src_a, src_b, dst_reference);
+		cpu_result = reduceKernelCpu(dst_reference.size, dst_reference);
+
+		timing_samples[run] = stopPerfTimer();
+	}
+	printTimingStats(timing_samples, NUM_TIMING_SAMPLES);
 	std::cout << "Done!\n\n";
 	dst_reference.free();
 
@@ -365,9 +394,6 @@ int program_main()
 	CHECK(clEnqueueWriteBuffer(cmd_queue, src_a_buf, CL_FALSE, 0, src_a.size * sizeof(float), src_a, 0, nullptr, nullptr));
 	CHECK(clEnqueueWriteBuffer(cmd_queue, src_b_buf, CL_FALSE, 0, src_b.size * sizeof(float), src_b, 0, nullptr, nullptr));
 	CHECK(clFinish(cmd_queue));
-
-	static const int NUM_TIMING_SAMPLES = 4096;
-	double timing_samples[NUM_TIMING_SAMPLES];
 
 	std::cout << "Executing OpenCL kernels...\n";
 	for (int run = 0; run < NUM_TIMING_SAMPLES; ++run) {
@@ -397,20 +423,8 @@ int program_main()
 
 		timing_samples[run] = (double)kernels_duration / 1000000.0;
 	}
-	{
-		double total_ms = std::accumulate(timing_samples, timing_samples+NUM_TIMING_SAMPLES, 0.0);
-		double mean_ms = total_ms / NUM_TIMING_SAMPLES;
+	printTimingStats(timing_samples, NUM_TIMING_SAMPLES);
 
-		double sqr_mean_ms = std::accumulate(timing_samples, timing_samples+NUM_TIMING_SAMPLES, 0.0, [](double a, double b) { return a + b*b; });
-		sqr_mean_ms /= NUM_TIMING_SAMPLES;
-
-		double std_dev_ms = std::sqrt(sqr_mean_ms - mean_ms*mean_ms);
-
-		std::cout << "Timing stats:\n" <<
-			"    Total: "     << total_ms    << "ms\n" <<
-			"    Mean: "      << mean_ms     << "ms\n" <<
-			"    Std. dev.: " << std_dev_ms  << "ms\n";
-	}
 
 	std::cout << "Reading computation results back to host...\n";
 	float gpu_result = 0.f;
