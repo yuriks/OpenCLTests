@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdlib>
 #include <memory>
+#include <numeric>
 
 template <typename T>
 struct Array {
@@ -165,7 +166,7 @@ cl_command_queue createCommandQueue(cl_context context, cl_device_id device_id)
 	std::cout << "Creating command queue...\n";
 
 	cl_int error_code;
-	cl_command_queue cmd_queue = clCreateCommandQueue(context, device_id, 0, &error_code);
+	cl_command_queue cmd_queue = clCreateCommandQueue(context, device_id, CL_QUEUE_PROFILING_ENABLE, &error_code);
 	CHECK(error_code);
 
 	return cmd_queue;
@@ -223,6 +224,14 @@ bool checkProgramLog(cl_program program, cl_device_id device_id)
 	return false;
 }
 
+cl_kernel createKernel(cl_program program, const char* kernel_name) {
+	std::cout << "Creating \"" << kernel_name << "\" kernel...\n";
+
+	cl_int error_code;
+	cl_kernel kernel = clCreateKernel(program, kernel_name, &error_code); CHECK(error_code);
+	return kernel;
+}
+
 void fillWithRandomData(Array<float>& v)
 {
 	for (size_t i = 0; i < v.size; ++i) {
@@ -240,15 +249,39 @@ void sumKernelCpu(size_t n, const float* src_a, const float* src_b, float* dst)
 	}
 }
 
+float reduceKernelCpu(size_t n, const float* src)
+{
+	float accum = 0.f;
+
+	for (size_t i = 0; i < n; ++i) {
+		accum += src[i];
+	}
+
+	return accum;
+}
+
+
+// GPU floating point precision is pretty horrible :P
+// Thanks to Bruce Dawson (http://bit.ly/xIW2Mf)
+bool compareFloat(float a, float b, float max_rel_diff = FLT_EPSILON*100.f)
+{
+    // Calculate the difference.
+    float diff = std::fabs(a - b);
+    a = std::fabs(a);
+    b = std::fabs(b);
+    // Find the largest
+    float largest = (b > a) ? b : a;
+
+    return diff <= largest * max_rel_diff;
+}
+
 bool compareResults(const Array<float>& v_a, const Array<float>& v_b)
 {
-	static const float EPS = 0.00005f;
-
 	if (v_a.size != v_b.size)
 		return false;
 
 	for (size_t i = 0; i < v_a.size; ++i) {
-		if (std::abs(v_a[i] - v_b[i]) > EPS) {
+		if (!compareFloat(v_a[i], v_b[i])) {
 			std::cout << i << '\n';
 			return false;
 		}
@@ -279,16 +312,20 @@ int program_main()
 		return 1;
 	}
 
-	std::cout << "Creating \"sum\" kernel...\n";
-	cl_kernel sum_kernel = clCreateKernel(program, "sum", &error_code); CHECK(error_code);
+	cl_kernel sum_kernel = createKernel(program, "sum");
+	cl_kernel reduce_pass1_kernel = createKernel(program, "reduce_pass1");
+	cl_kernel reduce_pass2_kernel = createKernel(program, "reduce_pass2");
 
 	std::cout << "Allocating host buffers...\n";
 
-	static const size_t WORK_DATA_SIZE = 8 * 1024 * 1024;
-	Array<float> src_a(WORK_DATA_SIZE);
-	Array<float> src_b(WORK_DATA_SIZE);
-	Array<float> dst_opencl(WORK_DATA_SIZE);
-	Array<float> dst_reference(WORK_DATA_SIZE);
+	static const size_t SUM_DATA_SIZE = 256 * 1024;
+	static const size_t SUM_GROUP_SIZE = 128;
+	static const size_t REDUCTION_WORK_ITEMS = 4 * 1024;
+	static const size_t REDUCTION_WORK_GROUP_SIZE = 512; // Max. supported by 9600GT
+	static const size_t PARTIAL_SUMS_SIZE = REDUCTION_WORK_ITEMS / REDUCTION_WORK_GROUP_SIZE;
+
+	Array<float> src_a(SUM_DATA_SIZE);
+	Array<float> src_b(SUM_DATA_SIZE);
 
 	srand(0);
 	fillWithRandomData(src_a);
@@ -296,18 +333,32 @@ int program_main()
 
 	std::cout << "Creating OpenCL buffers...\n";
 
-	cl_mem src_a_buf = clCreateBuffer(context, CL_MEM_READ_ONLY,  src_a.size      * sizeof(float), nullptr, &error_code); CHECK(error_code);
-	cl_mem src_b_buf = clCreateBuffer(context, CL_MEM_READ_ONLY,  src_b.size      * sizeof(float), nullptr, &error_code); CHECK(error_code);
-	cl_mem dst_buf   = clCreateBuffer(context, CL_MEM_WRITE_ONLY, dst_opencl.size * sizeof(float), nullptr, &error_code); CHECK(error_code);
+	cl_mem src_a_buf     = clCreateBuffer(context, CL_MEM_READ_ONLY,  src_a.size        * sizeof(float), nullptr, &error_code); CHECK(error_code);
+	cl_mem src_b_buf     = clCreateBuffer(context, CL_MEM_READ_ONLY,  src_b.size        * sizeof(float), nullptr, &error_code); CHECK(error_code);
+	cl_mem dst_buf       = clCreateBuffer(context, CL_MEM_READ_WRITE, SUM_DATA_SIZE     * sizeof(float), nullptr, &error_code); CHECK(error_code);
+	cl_mem sums_buf      = clCreateBuffer(context, CL_MEM_READ_WRITE, PARTIAL_SUMS_SIZE * sizeof(float), nullptr, &error_code); CHECK(error_code);
+	cl_mem final_sum_buf = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(float),                     nullptr, &error_code); CHECK(error_code);
 
 	std::cout << "Setting kernel arguments...\n";
 	CHECK(clSetKernelArg(sum_kernel, 0, sizeof(src_a_buf), &src_a_buf));
 	CHECK(clSetKernelArg(sum_kernel, 1, sizeof(src_b_buf), &src_b_buf));
 	CHECK(clSetKernelArg(sum_kernel, 2, sizeof(dst_buf),   &dst_buf));
 
+	CHECK(clSetKernelArg(reduce_pass1_kernel, 0, sizeof(dst_buf),  &dst_buf));
+	CHECK(clSetKernelArg(reduce_pass1_kernel, 1, sizeof(sums_buf), &sums_buf));
+	CHECK(clSetKernelArg(reduce_pass1_kernel, 2, REDUCTION_WORK_GROUP_SIZE * sizeof(float), nullptr));
+	CHECK(clSetKernelArg(reduce_pass1_kernel, 3, sizeof(size_t),   &SUM_DATA_SIZE));
+
+	CHECK(clSetKernelArg(reduce_pass2_kernel, 0, sizeof(sums_buf),      &sums_buf));
+	CHECK(clSetKernelArg(reduce_pass2_kernel, 1, sizeof(final_sum_buf), &final_sum_buf));
+	CHECK(clSetKernelArg(reduce_pass2_kernel, 2, sizeof(size_t),        &PARTIAL_SUMS_SIZE));
+
+	Array<float> dst_reference(SUM_DATA_SIZE);
 	std::cout << "\nRunning CPU algorithm...\n";
 	sumKernelCpu(dst_reference.size, src_a, src_b, dst_reference);
+	float cpu_result = reduceKernelCpu(dst_reference.size, dst_reference);
 	std::cout << "Done!\n\n";
+	dst_reference.free();
 
 	std::cout << "Copying from host to OpenCL buffers...\n";
 	CHECK(clFinish(cmd_queue));
@@ -315,18 +366,61 @@ int program_main()
 	CHECK(clEnqueueWriteBuffer(cmd_queue, src_b_buf, CL_FALSE, 0, src_b.size * sizeof(float), src_b, 0, nullptr, nullptr));
 	CHECK(clFinish(cmd_queue));
 
-	std::cout << "Executing OpenCL kernel...\n";
-	const cl_uint work_dimensions[1] = { WORK_DATA_SIZE };
-	CHECK(clEnqueueNDRangeKernel(cmd_queue, sum_kernel, 1, nullptr, work_dimensions, nullptr, 0, nullptr, nullptr));
-	CHECK(clFinish(cmd_queue));
+	static const int NUM_TIMING_SAMPLES = 4096;
+	double timing_samples[NUM_TIMING_SAMPLES];
+
+	std::cout << "Executing OpenCL kernels...\n";
+	for (int run = 0; run < NUM_TIMING_SAMPLES; ++run) {
+		cl_event first_kernel_event;
+		cl_event last_kernel_event;
+
+		const cl_uint sum_work_dim[1] = { SUM_DATA_SIZE };
+		const cl_uint sum_work_group_dim[1] = { SUM_GROUP_SIZE };
+		CHECK(clEnqueueNDRangeKernel(cmd_queue, sum_kernel, 1, nullptr, sum_work_dim, sum_work_group_dim, 0, nullptr, &first_kernel_event));
+
+		const cl_uint reduce_work_items_dim[1] = { REDUCTION_WORK_ITEMS };
+		const cl_uint reduce_work_group_dim[1] = { REDUCTION_WORK_GROUP_SIZE };
+		CHECK(clEnqueueNDRangeKernel(cmd_queue, reduce_pass1_kernel, 1, nullptr, reduce_work_items_dim, reduce_work_group_dim, 0, nullptr, nullptr));
+
+		CHECK(clEnqueueTask(cmd_queue, reduce_pass2_kernel, 0, nullptr, &last_kernel_event));
+
+		CHECK(clFinish(cmd_queue));
+
+		cl_ulong kernels_start_time;
+		cl_ulong kernels_end_time;
+		clGetEventProfilingInfo(first_kernel_event, CL_PROFILING_COMMAND_START, sizeof(kernels_start_time), &kernels_start_time, nullptr);
+		clGetEventProfilingInfo(last_kernel_event,  CL_PROFILING_COMMAND_END,   sizeof(kernels_end_time),   &kernels_end_time,   nullptr);
+		cl_ulong kernels_duration = kernels_end_time - kernels_start_time;
+
+		clReleaseEvent(first_kernel_event);
+		clReleaseEvent(last_kernel_event);
+
+		timing_samples[run] = (double)kernels_duration / 1000000.0;
+	}
+	{
+		double total_ms = std::accumulate(timing_samples, timing_samples+NUM_TIMING_SAMPLES, 0.0);
+		double mean_ms = total_ms / NUM_TIMING_SAMPLES;
+
+		double sqr_mean_ms = std::accumulate(timing_samples, timing_samples+NUM_TIMING_SAMPLES, 0.0, [](double a, double b) { return a + b*b; });
+		sqr_mean_ms /= NUM_TIMING_SAMPLES;
+
+		double std_dev_ms = std::sqrt(sqr_mean_ms - mean_ms*mean_ms);
+
+		std::cout << "Timing stats:\n" <<
+			"    Total: "     << total_ms    << "ms\n" <<
+			"    Mean: "      << mean_ms     << "ms\n" <<
+			"    Std. dev.: " << std_dev_ms  << "ms\n";
+	}
 
 	std::cout << "Reading computation results back to host...\n";
-	CHECK(clEnqueueReadBuffer(cmd_queue, dst_buf, CL_FALSE, 0, dst_opencl.size * sizeof(float), dst_opencl, 0, nullptr, nullptr));
+	float gpu_result = 0.f;
+	CHECK(clEnqueueReadBuffer(cmd_queue, final_sum_buf, CL_FALSE, 0, sizeof(gpu_result), &gpu_result, 0, nullptr, nullptr));
 	CHECK(clFinish(cmd_queue));
 	std::cout << "Done!\n\n";
 
 	std::cout << "Comparing results...\n";
-	if (compareResults(dst_opencl, dst_reference)) {
+	std::cout << "CPU: " << cpu_result << " - GPU: " << gpu_result << '\n';
+	if (compareFloat(cpu_result, gpu_result)) {
 		std::cout << "Results match!\n\n";
 	} else {
 		std::cout << "Results don't match! :(\n\n";
@@ -336,12 +430,12 @@ int program_main()
 	CHECK(clReleaseMemObject(src_a_buf));
 	CHECK(clReleaseMemObject(src_b_buf));
 	CHECK(clReleaseMemObject(dst_buf));
+	CHECK(clReleaseMemObject(sums_buf));
+	CHECK(clReleaseMemObject(final_sum_buf));
 
 	std::cout << "Freeing host buffers...\n";
 	src_a.free();
 	src_b.free();
-	dst_opencl.free();
-	dst_reference.free();
 
 	std::cout << "Releasing kernel...\n";
 	CHECK(clReleaseKernel(sum_kernel));
